@@ -1,0 +1,137 @@
+# Alpha-FPL Configuration
+# ========================
+# Hydra configuration for experiment management
+
+defaults:
+  - _self_
+  - experiment: default
+
+# Experiment metadata
+experiment:
+  name: "alpha_fpl_v1"
+  seed: 42
+  output_dir: "outputs/${experiment.name}"
+
+# Data ingestion and processing
+data:
+  # Seasons to include in training
+  seasons:
+    - "2021-22"
+    - "2022-23"
+    - "2023-24"
+    - "2024-25"
+  
+  # Directory structure
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  mappings_dir: "data/meta"
+  
+  # Feature engineering
+  window_size: 38  # Gameweeks
+  decay_rate: 0.05  # Weibull decay parameter (kappa)
+  recompute_defcon: true
+  
+  # DefCon thresholds (2025/26 rules)
+  defcon:
+    def_cbit_threshold: 10
+    mid_fwd_cbit_threshold: 12
+    defcon_points: 2
+
+# Bayesian inference model
+model:
+  type: "hierarchical_poisson"
+  
+  # MCMC settings
+  chains: 4
+  samples: 2000
+  warmup: 500
+  
+  # Hierarchical priors
+  priors:
+    alpha_sigma: 1.0      # Player ability shrinkage
+    team_sigma: 0.5       # Team effect shrinkage
+    position_sigma: 1.0   # Position effect shrinkage
+  
+  # Time decay for likelihood weighting
+  time_decay_kappa: 0.05
+  
+  # Device (cpu, gpu, tpu)
+  device: "tpu"  # For Colab TPU
+
+# Expected minutes (xMins) model
+xmins:
+  # Factors for xMins prediction
+  factors:
+    rest_days_weight: 0.15
+    flag_status_weight: 0.25
+    rotation_risk_weight: 0.20
+    fixture_congestion_weight: 0.15
+  
+  # Probability of starting by position
+  base_start_prob:
+    GKP: 0.90
+    DEF: 0.75
+    MID: 0.70
+    FWD: 0.80
+
+# Copula dependency modeling
+copula:
+  type: "t-copula"
+  scenarios: 1000
+  min_observations: 10  # Minimum matches for copula fit
+  
+  # t-Copula parameters
+  initial_df: 5  # Degrees of freedom (captures tail dependence)
+
+# Optimization engine
+optimization:
+  solver: "gurobi"
+  
+  # Risk-adjusted objective parameters
+  risk_aversion_lambda: 0.15  # Mean-variance tradeoff
+  cvar_alpha: 0.05            # CVaR confidence level (worst 5%)
+  
+  # Multi-stage planning
+  planning_horizon: 3  # Gameweeks ahead
+  
+  # DRO robustness
+  dro_radius: 0.01  # Wasserstein ball radius
+  
+  # Bench valuation
+  bench_auto_sub_prob: 0.10  # Probability a sub is needed
+  
+  # Budget constraints
+  initial_budget: 100.0  # Million
+  max_bank: 5.0          # Maximum bank allowance
+  
+  # Transfer constraints
+  hit_penalty: 4  # Points per extra transfer
+
+# Backtesting
+backtest:
+  # Walk-forward settings
+  start_gameweek: 5      # Allow warm-up period
+  validation_seasons:
+    - "2024-25"
+  
+  # Metrics to track
+  metrics:
+    - "total_points"
+    - "crps"
+    - "sharpe_ratio"
+    - "rank_percentile"
+
+# Weights & Biases tracking
+wandb:
+  enabled: true
+  project: "alpha-fpl"
+  entity: null  # Set to your W&B username
+  tags:
+    - "bayesian"
+    - "optimization"
+    - "fpl"
+
+# Logging
+logging:
+  level: "INFO"
+  format: "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>"

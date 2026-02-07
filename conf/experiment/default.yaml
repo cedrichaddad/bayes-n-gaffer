@@ -1,0 +1,15 @@
+# Default experiment configuration
+# Override these values for hyperparameter sweeps
+
+name: "default"
+description: "Default experiment with balanced risk-aversion"
+
+# Override specific model parameters
+model:
+  samples: 2000
+  chains: 4
+
+# Override optimization parameters
+optimization:
+  risk_aversion_lambda: 0.15
+  cvar_alpha: 0.05
