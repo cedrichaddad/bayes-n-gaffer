@@ -273,8 +273,55 @@ class BacktestRunner:
         
         # 3. Add scenario matrix from copula
         if self.copula is not None:
-            # ... generate scenarios
-            pass
+            # Extract expected points, stds, and posterior samples for copula
+            player_ids = solver_data["player_ids"]
+            
+            # Arrays for copula input
+            expected_points = []
+            point_stds = []
+            posterior_samples = []
+            
+            # Check if we have samples for all players
+            has_samples = True
+            
+            for pid in player_ids:
+                pred = predictions.get(pid, {})
+                expected_points.append(pred.get("mean", 2.0))
+                point_stds.append(pred.get("std", 2.0))
+                
+                # Check for samples
+                if "samples" in pred:
+                    posterior_samples.append(pred["samples"])
+                else:
+                    has_samples = False
+            
+            expected_points = np.array(expected_points)
+            point_stds = np.array(point_stds)
+            
+            # If we have posterior samples for everyone, stack them
+            # Shape: (n_samples, n_players)
+            if has_samples and posterior_samples:
+                # Transpose to (n_samples, n_players)
+                # individual samples are 1D arrays of length n_samples
+                posterior_matrix = np.column_stack(posterior_samples)
+            else:
+                posterior_matrix = None
+                
+            try:
+                # Generate scenarios using empirical quantile mapping
+                scenarios = self.copula.generate_scenarios(
+                    expected_points=expected_points,
+                    point_stds=point_stds,
+                    posterior_samples=posterior_matrix,
+                    n_scenarios=self.solver.config.n_scenarios
+                )
+                solver_data["scenario_matrix"] = scenarios
+                
+                # Also compute covariance matrix for objective
+                solver_data["covariance_matrix"] = self.copula.get_covariance_matrix(point_stds)
+                
+            except Exception as e:
+                logger.warning(f"Copula generation failed: {e}")
         
         # 4. Solve for optimal team
         solution = self.solver.solve(
@@ -375,10 +422,117 @@ class BacktestRunner:
         self,
         player_data: pl.DataFrame,
         gameweek: int,
+        historical_data: pl.DataFrame = None,
     ) -> dict:
-        """Generate predictions from the Bayesian model."""
-        # TODO: Full implementation with NumPyro
-        # For now, use simple form-based prediction
+        """
+        Generate predictions from the fitted Bayesian model.
+        
+        This is the critical connection between the NumPyro inference
+        and the optimization layer.
+        
+        Args:
+            player_data: Current gameweek player data
+            gameweek: Target gameweek
+            historical_data: Historical data for feature computation
+            
+        Returns:
+            Dictionary mapping player_id -> {mean, std, q05, q95, samples}
+        """
+        import jax
+        import jax.numpy as jnp
+        
+        predictions = {}
+        
+        # Check if model is available and fitted
+        if self.model is None or not hasattr(self.model, 'posterior_samples_'):
+            logger.warning("No fitted model available, falling back to form-based heuristic")
+            return self._fallback_form_predictions(player_data)
+        
+        try:
+            # Prepare prediction data using the model's prepare_data method
+            # This ensures consistent feature engineering
+            pred_data = self.model.prepare_data(player_data)
+            
+            # Generate posterior predictive samples
+            rng_key = jax.random.PRNGKey(gameweek)  # Reproducible per GW
+            posterior_predictive = self.model.predict(
+                pred_data, 
+                rng_key=rng_key,
+                num_samples=500,  # Fewer samples for speed during backtest
+            )
+            
+            # Extract player IDs for mapping
+            player_ids = player_data["fpl_id"].to_list()
+            
+            # Aggregate samples per player
+            # The predict method returns samples shaped (n_samples, n_observations)
+            # We need to aggregate by player since a player may have multiple obs
+            
+            goals_samples = posterior_predictive.get("goals_pred", None)
+            assists_samples = posterior_predictive.get("assists_pred", None)
+            defcon_samples = posterior_predictive.get("defcon_pred", None)
+            
+            # Get position info for points calculation
+            positions = player_data["position"].to_list()
+            pos_goal_pts = {"GKP": 6, "DEF": 6, "MID": 5, "FWD": 4}
+            pos_assist_pts = {"GKP": 3, "DEF": 3, "MID": 3, "FWD": 3}
+            
+            for i, pid in enumerate(player_ids):
+                pos = positions[i] if i < len(positions) else "MID"
+                goal_pts = pos_goal_pts.get(pos, 5)
+                assist_pts = pos_assist_pts.get(pos, 3)
+                
+                # Calculate total points samples
+                # Points = 2 (appearance) + goals*goal_pts + assists*assist_pts + defcon*2
+                if goals_samples is not None and i < goals_samples.shape[1]:
+                    goals = goals_samples[:, i]
+                    assists = assists_samples[:, i] if assists_samples is not None else 0
+                    defcon = defcon_samples[:, i] if defcon_samples is not None else 0
+                    
+                    # Total points per sample
+                    total_samples = (
+                        2 +  # Appearance points
+                        goals * goal_pts +
+                        assists * assist_pts +
+                        defcon * 2  # DefCon bonus
+                    )
+                    
+                    # Aggregate statistics
+                    mean_pts = float(jnp.mean(total_samples))
+                    std_pts = float(jnp.std(total_samples))
+                    q05 = float(jnp.percentile(total_samples, 5))
+                    q95 = float(jnp.percentile(total_samples, 95))
+                    
+                    predictions[pid] = {
+                        "mean": mean_pts,
+                        "std": std_pts,
+                        "q05": q05,
+                        "q95": q95,
+                        "samples": np.array(total_samples),  # Keep for copula
+                    }
+                else:
+                    # Fallback for missing players
+                    form = player_data.filter(
+                        pl.col("fpl_id") == pid
+                    )["form"].to_list()
+                    form_val = form[0] if form else 2.0
+                    
+                    predictions[pid] = {
+                        "mean": float(form_val) if form_val else 2.0,
+                        "std": 2.5,
+                        "q05": max(0, (form_val or 2.0) - 4),
+                        "q95": (form_val or 2.0) + 6,
+                    }
+            
+            logger.info(f"Generated Bayesian predictions for {len(predictions)} players")
+            return predictions
+            
+        except Exception as e:
+            logger.error(f"Bayesian prediction failed: {e}, falling back to heuristic")
+            return self._fallback_form_predictions(player_data)
+    
+    def _fallback_form_predictions(self, player_data: pl.DataFrame) -> dict:
+        """Fallback form-based predictions when model unavailable."""
         predictions = {}
         for row in player_data.iter_rows(named=True):
             pid = row.get("fpl_id")
@@ -390,7 +544,6 @@ class BacktestRunner:
                 "q05": max(0, form - 4),
                 "q95": form + 6,
             }
-        
         return predictions
     
     def _auto_select_starting_xi(

@@ -267,14 +267,21 @@ class TCopulaEngine:
         self,
         expected_points: np.ndarray,
         point_stds: np.ndarray,
+        posterior_samples: np.ndarray = None,
         n_scenarios: int = None,
     ) -> np.ndarray:
         """
         Generate correlated scenarios from the fitted copula.
         
+        KEY FIX: Uses empirical quantile mapping from Bayesian posterior samples
+        instead of assuming Gaussian marginals. This preserves the discrete,
+        skewed nature of the Zero-Inflated Poisson predictions.
+        
         Args:
             expected_points: E[Points] for each player (n_players,)
             point_stds: Std[Points] for each player (n_players,)
+            posterior_samples: Optional (n_samples, n_players) posterior samples
+                              for empirical quantile mapping
             n_scenarios: Number of scenarios (defaults to config)
             
         Returns:
@@ -289,20 +296,20 @@ class TCopulaEngine:
         # Adjust correlation matrix size if needed
         corr = self.correlation_matrix
         if corr.shape[0] != n_players:
-            # Subset or expand correlation matrix
             if corr.shape[0] > n_players:
                 corr = corr[:n_players, :n_players]
             else:
-                # Expand with uncorrelated players
                 new_corr = np.eye(n_players)
                 new_corr[:corr.shape[0], :corr.shape[1]] = corr
                 corr = new_corr
         
-        # Generate multivariate t samples
+        # =====================================================================
+        # Step 1: Generate multivariate t-distributed samples
         # Method: Z = sqrt(nu/chi2) * MVN, where chi2 ~ chi2(nu)
+        # =====================================================================
         nu = self.degrees_of_freedom
         
-        # MVN samples
+        # MVN samples with copula correlation
         mvn = np.random.multivariate_normal(
             mean=np.zeros(n_players),
             cov=corr,
@@ -319,14 +326,104 @@ class TCopulaEngine:
         # Transform to uniform via t-CDF
         uniform = stats.t.cdf(t_samples, df=nu)
         
-        # Inverse transform to points scale
-        # Assume Normal marginals for simplicity
-        z_samples = stats.norm.ppf(np.clip(uniform, 0.001, 0.999))
+        # =====================================================================
+        # Step 2: Inverse transform using empirical quantiles (NOT Gaussian)
+        # =====================================================================
         
-        scenarios = expected_points + z_samples * point_stds
+        if posterior_samples is not None:
+            # Use empirical quantile mapping from posterior samples
+            # This preserves the true marginal shape (discrete, skewed)
+            scenarios = self._empirical_quantile_transform(
+                uniform, posterior_samples
+            )
+        else:
+            # Fallback: Use stored marginal CDFs from fitting if available
+            if len(self.marginal_cdfs) > 0:
+                scenarios = self._inverse_pit_transform(
+                    uniform, expected_points, point_stds
+                )
+            else:
+                # Last resort: Gaussian (with warning)
+                logger.warning(
+                    "No posterior samples available - using Gaussian marginals. "
+                    "This may not preserve the ZI-Poisson shape."
+                )
+                z_samples = stats.norm.ppf(np.clip(uniform, 0.001, 0.999))
+                scenarios = expected_points + z_samples * point_stds
         
-        # Ensure non-negative points
+        # Ensure non-negative points (can't score less than 0)
         scenarios = np.maximum(scenarios, 0)
+        
+        return scenarios
+    
+    def _empirical_quantile_transform(
+        self,
+        uniform: np.ndarray,
+        posterior_samples: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Transform uniform samples to points using empirical posterior quantiles.
+        
+        This is the key fix: instead of assuming Normal marginals,
+        we use the actual shape of the Bayesian posterior prediction.
+        
+        Args:
+            uniform: Uniform samples from copula (n_scenarios, n_players)
+            posterior_samples: Posterior samples (n_posterior, n_players)
+            
+        Returns:
+            Points scenarios with correct marginal distributions
+        """
+        n_scenarios, n_players_u = uniform.shape
+        n_posterior, n_players_p = posterior_samples.shape
+        
+        n_players = min(n_players_u, n_players_p)
+        scenarios = np.zeros((n_scenarios, n_players))
+        
+        for j in range(n_players):
+            # Get empirical quantile function for this player
+            sorted_samples = np.sort(posterior_samples[:, j])
+            n_samples = len(sorted_samples)
+            
+            # Map uniform [0,1] to indices in sorted samples
+            indices = np.clip(
+                (uniform[:, j] * n_samples).astype(int),
+                0, n_samples - 1
+            )
+            
+            scenarios[:, j] = sorted_samples[indices]
+        
+        return scenarios
+    
+    def _inverse_pit_transform(
+        self,
+        uniform: np.ndarray,
+        expected_points: np.ndarray,
+        point_stds: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Inverse PIT using stored marginal CDFs from fitting.
+        
+        Falls back to shifted/scaled version if marginal not available.
+        """
+        n_scenarios, n_players = uniform.shape
+        scenarios = np.zeros((n_scenarios, n_players))
+        
+        for j in range(n_players):
+            if j in self.marginal_cdfs:
+                # Use stored empirical CDF
+                values = self.marginal_cdfs[j]["values"]
+                cdf_probs = np.linspace(0, 1, len(values))
+                
+                # Interpolate inverse CDF
+                residual_scenarios = np.interp(uniform[:, j], cdf_probs, values)
+                
+                # Scale back to points (residual + expected)
+                scenarios[:, j] = residual_scenarios * point_stds[j] + expected_points[j]
+            else:
+                # Fall back to Normal
+                z = stats.norm.ppf(np.clip(uniform[:, j], 0.001, 0.999))
+                scenarios[:, j] = expected_points[j] + z * point_stds[j]
         
         return scenarios
     

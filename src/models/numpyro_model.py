@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS, Predictive
-from numpyro.handlers import condition
+from numpyro.handlers import condition, scale
 import numpy as np
 import polars as pl
 from loguru import logger
@@ -173,15 +173,9 @@ class HierarchicalPointsModel:
         # Zero-inflation probability
         pi = phi_pos[position_idx[player_idx]]
         
-        # Zero-Inflated Poisson likelihood
-        with numpyro.plate("observations", len(player_idx)):
-            numpyro.sample(
-                "goals",
-                dist.ZeroInflatedPoisson(gate=pi, rate=lambda_goals),
-                obs=goals
-            )
-        
-        return lambda_goals
+        # Zero-Inflated Poisson likelihood with time decay weighting
+        # NOTE: time_weights must be passed to the calling model() function
+        return lambda_goals, pi
     
     def _defcon_model(
         self,
@@ -216,14 +210,7 @@ class HierarchicalPointsModel:
         )
         p_defcon = jax.nn.sigmoid(logit_p)
         
-        # Bernoulli likelihood
-        with numpyro.plate("obs_defcon", len(position_idx)):
-            numpyro.sample(
-                "defcon",
-                dist.Bernoulli(probs=p_defcon),
-                obs=defcon
-            )
-        
+        # Return probability for likelihood to be computed in parent
         return p_defcon
     
     def model(
@@ -267,13 +254,21 @@ class HierarchicalPointsModel:
             assists: Observed assists (None for prediction)
             defcon: Observed DefCon (None for prediction)
         """
+        # Default time weights to 1.0 if not provided
+        if time_weights is None:
+            time_weights = jnp.ones(len(player_idx))
+        
+        # ==================================================================
         # Goal scoring component
-        lambda_goals = self._goal_scoring_model(
+        # ==================================================================
+        lambda_goals, pi_goals = self._goal_scoring_model(
             player_idx, team_idx, opp_idx, position_idx, is_home,
-            n_players, n_teams, n_positions, goals
+            n_players, n_teams, n_positions, goals=None  # Likelihood computed below
         )
         
+        # ==================================================================
         # Assist component (similar structure, simplified)
+        # ==================================================================
         mu_assist = numpyro.sample("mu_assist", dist.Normal(-0.5, 0.5))
         sigma_assist = numpyro.sample("sigma_assist", dist.HalfNormal(0.5))
         
@@ -285,18 +280,41 @@ class HierarchicalPointsModel:
         
         lambda_assists = jnp.exp(jnp.clip(alpha_assist[player_idx], -5, 2))
         
-        with numpyro.plate("obs_assists", len(player_idx)):
-            numpyro.sample(
-                "assists_obs",
-                dist.Poisson(lambda_assists),
-                obs=assists
-            )
-        
+        # ==================================================================
         # DefCon component
-        self._defcon_model(
+        # ==================================================================
+        p_defcon = self._defcon_model(
             position_idx[player_idx], opp_possession, cbit_avg,
-            n_positions, defcon
+            n_positions, defcon=None  # Likelihood computed below
         )
+        
+        # ==================================================================
+        # CRITICAL FIX: Apply time_weights to all likelihoods
+        # This ensures recent observations have more influence on the posterior
+        # ==================================================================
+        with numpyro.plate("observations", len(player_idx)):
+            # Scale log-likelihood by time weights
+            with scale(scale=time_weights):
+                # Goals (Zero-Inflated Poisson)
+                numpyro.sample(
+                    "goals",
+                    dist.ZeroInflatedPoisson(gate=pi_goals, rate=lambda_goals),
+                    obs=goals
+                )
+                
+                # Assists (Poisson)
+                numpyro.sample(
+                    "assists_obs",
+                    dist.Poisson(lambda_assists),
+                    obs=assists
+                )
+                
+                # DefCon (Bernoulli)
+                numpyro.sample(
+                    "defcon",
+                    dist.Bernoulli(probs=p_defcon),
+                    obs=defcon
+                )
     
     def fit(
         self,
@@ -429,10 +447,17 @@ class HierarchicalPointsModel:
             if "was_home" in df.columns else [0] * len(df)
         )
         
-        opp_possession = jnp.array(
-            df["opp_possession"].fill_null(0.5).to_numpy()
-            if "opp_possession" in df.columns else [0.5] * len(df)
-        )
+        # CRITICAL: Use LAGGED opponent possession to avoid data leakage
+        # opp_possession should be the opponent's average possession in their LAST N games
+        # NOT the possession from the current game being predicted
+        if "opp_possession_lagged" in df.columns:
+            opp_possession = jnp.array(df["opp_possession_lagged"].fill_null(0.5).to_numpy())
+        elif "opp_possession" in df.columns:
+            # WARNING: Using non-lagged feature - potential data leakage!
+            logger.warning("Using opp_possession without lag - potential data leakage")
+            opp_possession = jnp.array(df["opp_possession"].fill_null(0.5).to_numpy())
+        else:
+            opp_possession = jnp.array([0.5] * len(df))
         
         cbit_avg = jnp.array(
             df["cbit"].fill_null(0).to_numpy()
