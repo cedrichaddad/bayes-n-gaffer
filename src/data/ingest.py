@@ -27,9 +27,9 @@ except ImportError:
 
 try:
     from understatapi import UnderstatClient
-except ImportError:
+except (ImportError, AttributeError, Exception) as e:
     UnderstatClient = None
-    logger.warning("understatapi not installed. Understat ingestion will be unavailable.")
+    logger.warning(f"understatapi import failed ({e}). Understat ingestion will be unavailable.")
 
 from .mappings import IDMapper
 
@@ -139,8 +139,10 @@ class DataIngester:
         """
         logger.info(f"Ingesting FPL data for season {season}...")
         
-        # Convert season format for GitHub
-        year = int("20" + season.split("-")[0])
+        # Convert season format for GitHub (e.g. "2023-24")
+        # Convert season format for GitHub (e.g. "2023-24")
+        parts = season.split("-")
+        year = int(parts[0]) if len(parts[0]) == 4 else int("20" + parts[0])
         github_season = f"{year}-{year % 100 + 1:02d}"
         
         # Try to load from raw cache first
@@ -154,7 +156,15 @@ class DataIngester:
         for gw in range(1, 39):
             gw_url = f"{VAASTAV_BASE_URL}/{github_season}/gws/gw{gw}.csv"
             try:
-                gw_df = pl.read_csv(gw_url)
+                # --- FIX: Deep Scan Schema Inference ---
+                # infer_schema_length=0 forces reading the WHOLE file to determine types (as String usually).
+                # This prevents "Float64" inference crashing on late-file strings.
+                gw_df = pl.read_csv(
+                    gw_url, 
+                    null_values=["None", "NaN", "nan", "null", " "], 
+                    infer_schema_length=0,
+                    ignore_errors=True
+                )
                 gw_df = gw_df.with_columns(
                     pl.lit(gw).alias("gameweek"),
                     pl.lit(season).alias("season"),
@@ -165,10 +175,12 @@ class DataIngester:
                 logger.warning(f"Failed to load GW{gw} for {season}: {e}")
                 continue
         
+        
         if not dfs:
             raise ValueError(f"No gameweek data found for season {season}")
         
-        df = pl.concat(dfs)
+        # Use diagonal concatenation to handle schema evolution within season
+        df = pl.concat(dfs, how="diagonal")
         
         # Standardize column names
         df = self._standardize_fpl_columns(df)
@@ -230,7 +242,7 @@ class DataIngester:
         if not dfs:
             raise ValueError("No FPL data ingested for any season")
         
-        combined = pl.concat(dfs, how="align")
+        combined = pl.concat(dfs, how="diagonal")
         logger.info(f"Combined FPL data: {len(combined)} rows across {len(dfs)} seasons")
         return combined
     
@@ -262,7 +274,9 @@ class DataIngester:
         
         # Use soccerdata to fetch FBref
         # Convert season format
-        year = int("20" + season.split("-")[0])
+        parts = season.split("-")
+        year = int(parts[0]) if len(parts[0]) == 4 else int("20" + parts[0])
+        # soccerdata expects "2021" or "2122", but "2021" usually works for start year
         sd_season = f"{year}"
         
         try:
@@ -328,7 +342,8 @@ class DataIngester:
             return pl.read_parquet(cache_path)
         
         # Convert season format
-        year = int("20" + season.split("-")[0])
+        parts = season.split("-")
+        year = int(parts[0]) if len(parts[0]) == 4 else int("20" + parts[0])
         understat_season = str(year)
         
         try:

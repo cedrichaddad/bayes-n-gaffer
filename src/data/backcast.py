@@ -441,6 +441,38 @@ class BackCaster:
         """
         logger.info("Starting DefCon back-casting pipeline...")
         
+        # --- Fix for Column Mismatches ---
+        # Ensure 'position' column exists (mapped from 'position_name' if needed)
+        if "position" not in df.columns and "position_name" in df.columns:
+            logger.info("Aliasing 'position_name' to 'position' for backcasting.")
+            df = df.with_columns(pl.col("position_name").alias("position"))
+        
+        # Ensure defensive columns exist (fill 0 if FBref ingestion failed)
+        required_def_cols = ["tackles", "interceptions", "blocks", "clearances", "recoveries"]
+        missing_cols = [col for col in required_def_cols if col not in df.columns]
+        
+        if missing_cols:
+            logger.warning(f"Missing defensive columns {missing_cols}. Filling with 0.")
+            df = df.with_columns([pl.lit(0).alias(col) for col in missing_cols])
+        # ---------------------------------
+        
+        # --- FIX: Force Numeric Types ---
+        # The raw CSVs contain "None" strings which makes Polars load these as String type.
+        # We must cast them to Int32 (turning "None"->Null) and fill with 0 before doing math.
+        numeric_cols = [
+            "minutes", "goals_scored", "assists", "clean_sheet", 
+            "goals_against", "saves", "penalties_saved", "yellow_card", 
+            "red_card", "own_goals", "penalties_missed", "bonus", "bps"
+        ]
+        
+        for col in numeric_cols:
+            if col in df.columns:
+                # strict=False converts errors (strings) to Null
+                df = df.with_columns(
+                    pl.col(col).cast(pl.Int32, strict=False).fill_null(0)
+                )
+        # --------------------------------
+        
         # Step 1: Calculate CBIT
         logger.info("Calculating CBIT...")
         df = self.calculate_cbit(df)

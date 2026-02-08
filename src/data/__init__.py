@@ -8,12 +8,10 @@ from .ingest import DataIngester
 from .backcast import BackCaster
 from .features import FeatureEngineer
 from .mappings import IDMapper
-from .xmins import XMinsPredictor
 
 __all__ = [
     "DataIngester",
     "BackCaster",
     "FeatureEngineer",
     "IDMapper",
-    "XMinsPredictor",
 ]

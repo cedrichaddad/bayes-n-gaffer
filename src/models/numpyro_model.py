@@ -349,7 +349,10 @@ class HierarchicalPointsModel:
             progress_bar=True
         )
         
-        self.mcmc.run(rng_key, **data)
+        # Filter data for model (exclude metadata like _player_to_idx)
+        model_data = {k: v for k, v in data.items() if not k.startswith("_")}
+        
+        self.mcmc.run(rng_key, **model_data)
         self.posterior_samples = self.mcmc.get_samples()
         
         # Log diagnostics
@@ -442,10 +445,23 @@ class HierarchicalPointsModel:
         ])
         
         # Features
-        is_home = jnp.array(
-            df["was_home"].cast(pl.Int32).fill_null(0).to_numpy() 
-            if "was_home" in df.columns else [0] * len(df)
-        )
+        if "was_home" in df.columns:
+            if df["was_home"].dtype == pl.Utf8:
+                # Handle "True"/"False" strings from CSV
+                home_vals = (
+                    pl.when(pl.col("was_home") == "True")
+                    .then(1)
+                    .otherwise(0)
+                    .cast(pl.Int32)
+                )
+                # Ensure we use the expression on the dataframe to get series
+                is_home = jnp.array(
+                    df.select(home_vals).to_series().to_numpy()
+                )
+            else:
+                is_home = jnp.array(df["was_home"].cast(pl.Int32).fill_null(0).to_numpy())
+        else:
+            is_home = jnp.array([0] * len(df))
         
         # CRITICAL: Use LAGGED opponent possession to avoid data leakage
         # opp_possession should be the opponent's average possession in their LAST N games
