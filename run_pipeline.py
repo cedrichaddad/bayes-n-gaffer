@@ -55,6 +55,7 @@ def main(cfg: DictConfig):
     
     from src.data.ingest import DataIngester
     from src.data.backcast import BackCaster, DefConConfig
+    from src.data.features import FeatureEngineer
     
     # Initialize ingester
     ingester = DataIngester(
@@ -70,6 +71,19 @@ def main(cfg: DictConfig):
         logger.info(f"Merged dataset: {len(merged_df)} rows")
     except Exception as e:
         logger.error(f"Data ingestion failed: {e}")
+        raise
+
+    # =========================================================================
+    # Step 1.5: Feature Engineering
+    # =========================================================================
+    logger.info("Step 1.5: Feature Engineering")
+    
+    try:
+        feature_engineer = FeatureEngineer()
+        merged_df = feature_engineer.generate_features(merged_df)
+        logger.info(f"Features generated. Columns: {merged_df.columns}")
+    except Exception as e:
+        logger.error(f"Feature engineering failed: {e}")
         raise
     
     # =========================================================================
@@ -227,6 +241,7 @@ def main(cfg: DictConfig):
         model=model,
         copula=copula,
         solver=solver,
+        xmins_model=xmins_model,
         config=backtest_config,
     )
     

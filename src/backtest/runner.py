@@ -112,6 +112,7 @@ class BacktestRunner:
         model,
         copula,
         solver,
+        xmins_model=None,
         config: BacktestConfig = None,
     ):
         """
@@ -121,11 +122,13 @@ class BacktestRunner:
             model: Fitted HierarchicalPointsModel
             copula: Fitted TCopulaEngine
             solver: StochasticMIQPSolver
+            xmins_model: Fitted XMinsModel (optional but recommended)
             config: Backtest configuration
         """
         self.model = model
         self.copula = copula
         self.solver = solver
+        self.xmins_model = xmins_model
         self.config = config or BacktestConfig()
         
         # State
@@ -203,8 +206,9 @@ class BacktestRunner:
         
         # If we have predictions, use them
         if predictions is not None:
+            # FIX: Default missing players to 0.0, NOT 2.0
             expected_points = np.array([
-                predictions.get(pid, {}).get("mean", 2.0)
+                predictions.get(pid, {}).get("mean", 0.0)
                 for pid in player_df["fpl_id"].to_list()
             ])
             point_stds = np.array([
@@ -213,7 +217,7 @@ class BacktestRunner:
             ])
         else:
             # Use simple heuristic (form-based)
-            expected_points = player_df["form"].fill_null(2.0).to_numpy()
+            expected_points = player_df["form"].fill_null(0.0).to_numpy()
             point_stds = np.ones(n_players) * 2.0
         
         # Position encoding
@@ -231,13 +235,33 @@ class BacktestRunner:
         # Prices
         prices = player_df["now_cost"].fill_null(50).to_numpy() / 10  # Convert to millions
         
-        # xMins factors (use 1.0 if not available)
-        xmins = np.ones(n_players)
+        # xMins factors
+        if self.xmins_model is not None:
+            try:
+                # Use predict_batch to get minutes adjustment
+                # Note: valid gameweek_context (rest days, flags) should ideally be passed here
+                # For now, we rely on the model's defaults or available columns
+                xmins_df = self.xmins_model.predict_batch(player_df)
+                
+                # Extract the adjustment factor (expected_mins / 90)
+                if "minutes_adjustment_factor" in xmins_df.columns:
+                    xmins_factors = xmins_df["minutes_adjustment_factor"].fill_null(1.0).to_numpy()
+                else:
+                    logger.warning("xMins model did not return adjustment factor")
+                    xmins_factors = np.ones(n_players)
+
+            except Exception as e:
+                logger.warning(f"xMins prediction failed: {e}. Using 1.0 factors.")
+                xmins_factors = np.ones(n_players)
+        else:
+            xmins_factors = np.ones(n_players)
+            
+        xmins_factors = np.clip(xmins_factors, 0.0, 1.0)
         
         return {
             "expected_points": expected_points,
             "point_stds": point_stds,
-            "xmins_factors": xmins,
+            "xmins_factors": xmins_factors,
             "positions": positions,
             "teams": team_indices,
             "prices": prices,
