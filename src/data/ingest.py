@@ -27,7 +27,7 @@ except ImportError:
 
 try:
     from understatapi import UnderstatClient
-except (ImportError, AttributeError, Exception) as e:
+except Exception as e:
     UnderstatClient = None
     logger.warning(f"understatapi import failed ({e}). Understat ingestion will be unavailable.")
 
