@@ -295,7 +295,8 @@ class ObjectiveBuilder:
         )
         
         # Variance penalty
-        full_weights = weights_start + weights_bench
+        # Effective weight: Start (1x) + Bench (1x) + Captain_Bonus (1x) = Captain is 2x
+        full_weights = weights_start + weights_bench + weights_captain
         variance = self.compute_variance_penalty(cov, full_weights)
         variance_penalty = lambda_risk * variance
         

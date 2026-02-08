@@ -132,10 +132,13 @@ class BacktestRunner:
         self.config = config or BacktestConfig()
         
         # State
-        self.current_squad = None
+        self.current_squad_ids = set()  # Store IDs, not indices!
         self.current_bank = 0.0
         self.free_transfers = 1
         self.team_value = 100.0
+        
+        # Player Registry: Cache static info (pos, team, price) for missing players
+        self.player_registry = {}
         
         # Results
         self.results: List[GameweekResult] = []
@@ -161,6 +164,19 @@ class BacktestRunner:
             }
         )
     
+    def _update_registry(self, player_data: pl.DataFrame):
+        """Update player registry with latest static data."""
+        for row in player_data.iter_rows(named=True):
+            pid = row["fpl_id"]
+            self.player_registry[pid] = {
+                "fpl_id": pid,
+                "name": row.get("name", f"Player_{pid}"),
+                "position": row["position"],
+                "team_name": row["team_name"],
+                "now_cost": row.get("now_cost", 50),
+                # Add dummy columns needed for schema if reinventing
+            }
+
     def _select_initial_squad(
         self,
         player_data: pl.DataFrame,
@@ -171,6 +187,7 @@ class BacktestRunner:
         
         Uses solver with unlimited transfers (wildcard mode).
         """
+        self._update_registry(player_data)
         logger.info("Selecting initial squad...")
         
         # Prepare player data for solver
@@ -185,7 +202,12 @@ class BacktestRunner:
         if solution.get("status") == "infeasible":
             raise ValueError("Could not select initial squad")
         
-        return solution["squad"]
+        # Return list of IDs for selected players
+        squad_indices = np.where(solution["squad"])[0]
+        player_ids = player_data["fpl_id"].to_list()
+        selected_ids = {player_ids[i] for i in squad_indices}
+        
+        return selected_ids
     
     def _prepare_solver_data(
         self,
@@ -289,6 +311,78 @@ class BacktestRunner:
         """
         logger.info(f"Running backtest GW{gameweek} ({season})...")
         
+        # 0. Update registry and handle missing players (Blank GW fix)
+        self._update_registry(player_data)
+        
+        current_pids = set(player_data["fpl_id"].to_list())
+        missing_ids = self.current_squad_ids - current_pids
+        
+        if missing_ids:
+            logger.warning(f"Found {len(missing_ids)} owned players missing from GW{gameweek} data (Blank GW?). Re-injecting.")
+            missing_rows = []
+            
+            # Get actual schema from player_data to match
+            # We construct a minimal safe row
+            schema = player_data.schema
+            
+            for pid in missing_ids:
+                info = self.player_registry.get(pid)
+                if not info:
+                    logger.error(f"Missing player {pid} not in registry! Cannot re-inject.")
+                    continue
+                
+                # Create dict with defaults
+                row_dict = {
+                    "fpl_id": pid,
+                    "name": info["name"],
+                    "position": info["position"],
+                    "team_name": info["team_name"],
+                    "now_cost": info["now_cost"],
+                    "season": season,
+                    "gameweek": gameweek,
+                    "minutes": 0,
+                    "total_points": 0,
+                    "form": 0.0,
+                    # Add other required columns if they effectively key errors
+                }
+                missing_rows.append(row_dict)
+            
+            if missing_rows:
+                # Polars vstack requires same schema. 
+                # Simplest way: create small DF with same schema, using 'from_dicts' might be strict?
+                # Let's try to concat. 
+                try:
+                    # Fill missing keys with reasonable defaults or cast to schema
+                    # This is tricky with Polars strictness. 
+                    # Strategy: Filter player_data to 0 rows, append our dicts? No.
+                    # Strategy: Create DF from dicts, join?
+                    # Strategy: We assume player_data has many cols. 
+                    # Let's use a simplified approach: just ensure we pass them to solver_data
+                    # BUT passing them to solver_data entails having them in player_data for "predictions" and "xMins".
+                    
+                    # Better Strategy: 
+                    # Creating a dummy DF for missing players with 0s for everything else.
+                    # We need to map the columns present in player_data.
+                    cols = player_data.columns
+                    data_dict = {c: [] for c in cols}
+                    
+                    for row in missing_rows:
+                        for c in cols:
+                             val = row.get(c, 0) # Default 0 for metrics
+                             # Handle string types if needed
+                             if c == "position": val = row["position"]
+                             if c == "team_name": val = row["team_name"]
+                             if c == "name": val = row["name"]
+                             if c == "season": val = season
+                             data_dict[c].append(val)
+                    
+                    missing_df = pl.DataFrame(data_dict, schema=player_data.schema)
+                    player_data = pl.concat([player_data, missing_df])
+                    logger.info(f"Re-injected {len(missing_df)} players into player_data")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to re-inject missing players: {e}")
+        
         # 1. Generate predictions from model
         predictions = self._generate_predictions(player_data, gameweek)
         
@@ -297,6 +391,9 @@ class BacktestRunner:
         
         # 3. Add scenario matrix from copula
         if self.copula is not None:
+            # Used later
+            pass
+            
             # Extract expected points, stds, and posterior samples for copula
             player_ids = solver_data["player_ids"]
             
@@ -347,10 +444,31 @@ class BacktestRunner:
             except Exception as e:
                 logger.warning(f"Copula generation failed: {e}")
         
+        # CRITICAL FIX: Map owned IDs to current indices
+        # This prevents "Index Misalignment" bug where players shift rows between GWs
+        current_squad_vector = np.zeros(len(solver_data["player_ids"]))
+        current_player_ids = solver_data["player_ids"]
+        
+        # Check for missing players (sold/loaned out but still in our squad)
+        missing_players = []
+        for pid in self.current_squad_ids:
+            if pid not in current_player_ids:
+                 # Player left the league/game? We technically still own them but can't sell them easily
+                 # Logic: If they are not in the solver data, we can't sell them.
+                 # Better approach: Ensure all owned players are in player_data via left join upstream.
+                 # For now, warn.
+                 logger.warning(f"Player {pid} in squad but not in current GW data!")
+                 missing_players.append(pid)
+        
+        # Build binary vector based on ID match
+        for i, pid in enumerate(current_player_ids):
+            if pid in self.current_squad_ids:
+                current_squad_vector[i] = 1.0
+        
         # 4. Solve for optimal team
         solution = self.solver.solve(
             player_data=solver_data,
-            current_squad=self.current_squad,
+            current_squad=current_squad_vector,
             free_transfers=self.free_transfers,
             budget=self.team_value + self.current_bank,
         )
@@ -358,13 +476,22 @@ class BacktestRunner:
         if solution.get("status") == "infeasible":
             logger.warning(f"GW{gameweek}: Optimization infeasible, keeping current squad")
             # Keep current squad (no transfers)
-            starting_indices = self._auto_select_starting_xi(self.current_squad, solver_data)
-            captain_idx = starting_indices[0]  # Simple: highest expected
+            # We need indices for auto-select
+            current_indices = np.where(current_squad_vector == 1)[0]
+            if len(current_indices) == 0:
+                 # Fallback if squad is empty? Should not happen.
+                 logger.error("Current squad vector is empty during infeasible fallback")
+                 starting_indices = []
+                 captain_idx = 0
+            else:
+                starting_indices = self._auto_select_starting_xi(current_squad_vector, solver_data)
+                captain_idx = starting_indices[0] if len(starting_indices) > 0 else 0
+            
             solution = {
-                "squad": self.current_squad,
+                "squad": current_squad_vector,
                 "starting_indices": starting_indices,
                 "captain_idx": captain_idx,
-                "vice_captain_idx": starting_indices[1],
+                "vice_captain_idx": starting_indices[1] if len(starting_indices) > 1 else 0,
                 "transfers_in": [],
                 "transfers_out": [],
                 "hits": 0,
@@ -393,8 +520,16 @@ class BacktestRunner:
         hit_cost = solution["hits"] * self.solver.constraints.config.hit_penalty
         total_actual -= hit_cost
         
-        # 6. Update state
-        self.current_squad = solution["squad"]
+        # 6. Update state (Store IDs!)
+        # solution["squad"] is binary vector for THIS gameweek's indices
+        new_squad_indices = np.where(solution["squad"])[0]
+        self.current_squad_ids = {player_ids[i] for i in new_squad_indices}
+        
+        # Add back any missing players (can't sell them if they aren't in data)
+        # This is a safety mechanism
+        for pid in missing_players:
+            self.current_squad_ids.add(pid)
+            
         self.cumulative_points += total_actual
         self.cumulative_hits += solution["hits"]
         
@@ -653,7 +788,8 @@ class BacktestRunner:
         gw1_players = season_players.filter(pl.col("gameweek") == 1)
         
         # Select initial squad
-        self.current_squad = self._select_initial_squad(gw1_players)
+        # Select initial squad (returns set of IDs)
+        self.current_squad_ids = self._select_initial_squad(gw1_players)
         self.current_bank = 0.0
         self.free_transfers = 1
         
