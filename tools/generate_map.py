@@ -63,7 +63,8 @@ def fetch_fbref_players(season: str) -> pl.DataFrame:
     try:
         import soccerdata as sd
         
-        year = int("20" + season.split("-")[0])
+        parts = season.split("-")
+        year = int(parts[0]) if len(parts[0]) == 4 else int("20" + parts[0])
         fbref = sd.FBref(leagues="ENG-Premier League", seasons=str(year))
         
         # Get player stats (any stat type to get player list)
@@ -89,7 +90,8 @@ def fetch_understat_players(season: str) -> pl.DataFrame:
     try:
         from understatapi import UnderstatClient
         
-        year = int("20" + season.split("-")[0])
+        parts = season.split("-")
+        year = int(parts[0]) if len(parts[0]) == 4 else int("20" + parts[0])
         client = UnderstatClient()
         
         players = client.league(league="EPL").get_player_data(season=str(year))
